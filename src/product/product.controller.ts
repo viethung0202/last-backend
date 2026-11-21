@@ -1,5 +1,6 @@
 import { Body, Controller, Delete, Get, Param, Patch, Post, UseGuards } from '@nestjs/common';
 import { ProductService } from './product.service';
+import type { ProductInput } from './product.service';
 import { TenantGuard } from '../store/tenant.guard';
 import { CurrentStore } from '../store/current-store.decorator';
 import { MerchantAuthGuard } from '../auth/merchant-auth.guard';
@@ -15,21 +16,14 @@ export class ProductController {
     return this.productService.findAllForStore(store.id);
   }
 
+  @Get(':productId')
+  findOne(@CurrentStore() store: { id: string }, @Param('productId') productId: string) {
+    return this.productService.findOne(store.id, productId);
+  }
+
   @Post()
   @UseGuards(MerchantAuthGuard, StoreMemberGuard)
-  create(
-    @CurrentStore() store: { id: string },
-    @Body()
-    body: {
-      name?: string;
-      description?: string;
-      price?: number | string;
-      stock?: number;
-      status?: 'DRAFT' | 'ACTIVE';
-      categorySlug?: string | null;
-      collectionIds?: string[];
-    },
-  ) {
+  create(@CurrentStore() store: { id: string }, @Body() body: ProductInput) {
     return this.productService.create(store.id, body);
   }
 
@@ -38,26 +32,14 @@ export class ProductController {
   update(
     @CurrentStore() store: { id: string },
     @Param('productId') productId: string,
-    @Body()
-    body: {
-      name?: string;
-      description?: string | null;
-      price?: number | string;
-      stock?: number;
-      status?: 'DRAFT' | 'ACTIVE';
-      categorySlug?: string | null;
-      collectionIds?: string[];
-    },
+    @Body() body: ProductInput,
   ) {
     return this.productService.update(store.id, productId, body);
   }
 
   @Delete(':productId')
   @UseGuards(MerchantAuthGuard, StoreMemberGuard)
-  remove(
-    @CurrentStore() store: { id: string },
-    @Param('productId') productId: string,
-  ) {
+  remove(@CurrentStore() store: { id: string }, @Param('productId') productId: string) {
     return this.productService.remove(store.id, productId);
   }
 }

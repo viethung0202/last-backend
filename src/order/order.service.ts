@@ -3,7 +3,8 @@ import {
   Injectable,
   NotFoundException,
 } from '@nestjs/common';
-import { OrderStatus, PaymentMethod, PaymentStatus, Prisma, ProductStatus } from '@prisma/client';
+import { Discount, OrderStatus, PaymentMethod, PaymentStatus, Prisma, ProductStatus } from '@prisma/client';
+import { DiscountService } from '../discount/discount.service';
 import { PaymentService } from '../payment/payment.service';
 import { PrismaService } from '../prisma/prisma.service';
 
@@ -11,6 +12,7 @@ type CreateOrderInput = {
   guestEmail?: string;
   guestName?: string;
   paymentMethod?: PaymentMethod;
+  discountCode?: string;
   // VNPAY only: storefront page VNPAY redirects back to
   returnUrl?: string;
   items?: Array<{
@@ -19,16 +21,39 @@ type CreateOrderInput = {
   }>;
 };
 
+export type DraftInput = {
+  guestEmail?: string;
+  guestName?: string;
+  note?: string;
+  discountCode?: string;
+  items?: Array<{ variantId?: string; quantity?: number }>;
+};
+
+type Priced = {
+  orderItems: Array<{
+    variantId: string;
+    productNameSnapshot: string;
+    variantLabelSnapshot: string;
+    unitPrice: Prisma.Decimal;
+    quantity: number;
+  }>;
+  subtotal: Prisma.Decimal;
+  discount: Discount | null;
+  discountAmount: Prisma.Decimal;
+  total: Prisma.Decimal;
+};
+
 @Injectable()
 export class OrderService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly payments: PaymentService,
+    private readonly discounts: DiscountService,
   ) {}
 
   findAllForStore(storeId: string) {
     return this.prisma.order.findMany({
-      where: { storeId },
+      where: { storeId, status: { not: OrderStatus.DRAFT } },
       orderBy: { createdAt: 'desc' },
       include: { items: true, payments: true },
     });
@@ -37,7 +62,7 @@ export class OrderService {
   // Public order tracking: guest proves ownership with the email used at checkout.
   async findForGuest(storeId: string, orderId: string, email: string | undefined) {
     const order = await this.prisma.order.findFirst({
-      where: { id: orderId, storeId, guestEmail: email?.trim().toLowerCase() || '-' },
+      where: { id: orderId, storeId, status: { not: OrderStatus.DRAFT }, guestEmail: email?.trim().toLowerCase() || '-' },
       include: { items: true, payments: true },
     });
     if (!order) {
@@ -64,49 +89,12 @@ export class OrderService {
       throw new BadRequestException('items are required');
     }
 
-    const quantities = new Map<string, number>();
-    for (const item of items) {
-      const variantId = this.requiredText(item.variantId, 'variantId');
-      const quantity = this.requiredCount(item.quantity, 'quantity');
-      quantities.set(variantId, (quantities.get(variantId) ?? 0) + quantity);
-    }
-
-    const variants = await this.prisma.productVariant.findMany({
-      where: {
-        id: { in: [...quantities.keys()] },
-        product: { storeId, status: ProductStatus.ACTIVE },
-      },
-      include: { product: true },
-    });
-    if (variants.length !== quantities.size) {
-      throw new BadRequestException('Some variants are not available');
-    }
-
-    let total = new Prisma.Decimal(0);
-    const orderItems = variants.map((variant) => {
-      const quantity = quantities.get(variant.id) ?? 0;
-      if (variant.stock < quantity) {
-        throw new BadRequestException(`${variant.product.name} is out of stock`);
-      }
-      total = total.plus(variant.price.times(quantity));
-      return {
-        variantId: variant.id,
-        productNameSnapshot: variant.product.name,
-        variantLabelSnapshot: this.variantLabel(variant.optionValues),
-        unitPrice: variant.price,
-        quantity,
-      };
-    });
+    const priced = await this.price(this.prisma, storeId, items, input.discountCode, true);
 
     // ponytail: stock is reserved at order time; unpaid VNPAY orders keep it until
     // the merchant cancels. Add an expiry job (BullMQ) if that becomes a problem.
     const order = await this.prisma.$transaction(async (tx) => {
-      for (const item of orderItems) {
-        await tx.productVariant.update({
-          where: { id: item.variantId },
-          data: { stock: { decrement: item.quantity } },
-        });
-      }
+      await this.reserve(tx, priced);
 
       // one Customer per store + email; guest name/email stay on the order as a snapshot
       const customer = await tx.customer.upsert({
@@ -121,9 +109,9 @@ export class OrderService {
           customerId: customer.id,
           guestEmail,
           guestName,
-          total,
-          items: { create: orderItems },
-          payments: { create: { method: paymentMethod, amount: total } },
+          ...this.orderTotals(priced),
+          items: { create: priced.orderItems },
+          payments: { create: { method: paymentMethod, amount: priced.total } },
         },
         include: { items: true, payments: true },
       });
@@ -137,12 +125,12 @@ export class OrderService {
   }
 
   async updateStatus(storeId: string, orderId: string, status: OrderStatus) {
-    if (!Object.values(OrderStatus).includes(status)) {
+    if (!Object.values(OrderStatus).includes(status) || status === OrderStatus.DRAFT) {
       throw new BadRequestException('Invalid order status');
     }
 
     const order = await this.prisma.order.findFirst({
-      where: { id: orderId, storeId },
+      where: { id: orderId, storeId, status: { not: OrderStatus.DRAFT } },
       select: { id: true },
     });
     if (!order) {
@@ -163,6 +151,191 @@ export class OrderService {
         include: { items: true, payments: true },
       });
     });
+  }
+
+  // ---- draft orders (merchant-created, no stock reserved until completed) ----
+
+  findDrafts(storeId: string) {
+    return this.prisma.order.findMany({
+      where: { storeId, status: OrderStatus.DRAFT },
+      orderBy: { createdAt: 'desc' },
+      include: { items: true },
+    });
+  }
+
+  async findDraft(storeId: string, id: string) {
+    const draft = await this.prisma.order.findFirst({
+      where: { id, storeId, status: OrderStatus.DRAFT },
+      include: { items: true },
+    });
+    if (!draft) {
+      throw new NotFoundException('Draft order not found');
+    }
+    return draft;
+  }
+
+  async createDraft(storeId: string, input: DraftInput) {
+    const priced = await this.price(this.prisma, storeId, input.items ?? [], input.discountCode, false);
+    return this.prisma.order.create({
+      data: { storeId, status: OrderStatus.DRAFT, ...this.draftFields(input), ...this.orderTotals(priced), items: { create: priced.orderItems } },
+      include: { items: true },
+    });
+  }
+
+  async updateDraft(storeId: string, id: string, input: DraftInput) {
+    await this.findDraft(storeId, id);
+    const priced = await this.price(this.prisma, storeId, input.items ?? [], input.discountCode, false);
+    return this.prisma.$transaction(async (tx) => {
+      await tx.orderItem.deleteMany({ where: { orderId: id } });
+      return tx.order.update({
+        where: { id },
+        data: { ...this.draftFields(input), ...this.orderTotals(priced), items: { create: priced.orderItems } },
+        include: { items: true },
+      });
+    });
+  }
+
+  async deleteDraft(storeId: string, id: string) {
+    await this.findDraft(storeId, id);
+    await this.prisma.$transaction([
+      this.prisma.orderItem.deleteMany({ where: { orderId: id } }),
+      this.prisma.order.delete({ where: { id } }),
+    ]);
+    return { deleted: true };
+  }
+
+  // Turns a draft into a real order: re-prices at today's prices, reserves stock,
+  // creates the customer. ponytail: manual payment only (cash/bank transfer, COD record);
+  // a VNPAY payment link for drafts can reuse PaymentService.vnpayUrl later.
+  async completeDraft(storeId: string, id: string, markPaid: boolean) {
+    const draft = await this.findDraft(storeId, id);
+    const guestEmail = this.requiredEmail(draft.guestEmail ?? undefined);
+    const guestName = this.requiredText(draft.guestName ?? undefined, 'guestName');
+    const priced = await this.price(
+      this.prisma,
+      storeId,
+      draft.items.flatMap((i) => (i.variantId ? [{ variantId: i.variantId, quantity: i.quantity }] : [])),
+      draft.discountCode ?? undefined,
+      false,
+    );
+    if (priced.orderItems.length !== draft.items.length) {
+      throw new BadRequestException('A product in this draft no longer exists');
+    }
+
+    return this.prisma.$transaction(async (tx) => {
+      await this.reserve(tx, priced);
+      const customer = await tx.customer.upsert({
+        where: { storeId_email: { storeId, email: guestEmail } },
+        update: {},
+        create: { storeId, email: guestEmail, name: guestName },
+      });
+      await tx.orderItem.deleteMany({ where: { orderId: id } });
+      return tx.order.update({
+        where: { id },
+        data: {
+          customerId: customer.id,
+          status: markPaid ? OrderStatus.PAID : OrderStatus.PENDING,
+          ...this.orderTotals(priced),
+          items: { create: priced.orderItems },
+          payments: {
+            create: {
+              method: PaymentMethod.COD,
+              amount: priced.total,
+              ...(markPaid ? { status: PaymentStatus.SUCCEEDED, paidAt: new Date() } : {}),
+            },
+          },
+        },
+        include: { items: true, payments: true },
+      });
+    });
+  }
+
+  // ---- pricing -------------------------------------------------------------
+
+  private draftFields(input: DraftInput) {
+    return {
+      guestEmail: input.guestEmail?.trim().toLowerCase() || null,
+      guestName: input.guestName?.trim() || null,
+      note: input.note?.trim() || null,
+    };
+  }
+
+  private orderTotals(p: Priced) {
+    return {
+      subtotal: p.subtotal,
+      discountCode: p.discount?.code ?? null,
+      discountAmount: p.discountAmount,
+      total: p.total,
+    };
+  }
+
+  // Prices cart lines from the DB (never trusts the client) and applies the discount code.
+  private async price(
+    db: PrismaService,
+    storeId: string,
+    items: Array<{ variantId?: string; quantity?: number }>,
+    discountCode: string | undefined,
+    activeOnly: boolean,
+  ): Promise<Priced> {
+    if (items.length === 0) {
+      throw new BadRequestException('items are required');
+    }
+    const quantities = new Map<string, number>();
+    for (const item of items) {
+      const variantId = this.requiredText(item.variantId, 'variantId');
+      const quantity = this.requiredCount(item.quantity, 'quantity');
+      quantities.set(variantId, (quantities.get(variantId) ?? 0) + quantity);
+    }
+
+    const variants = await db.productVariant.findMany({
+      where: {
+        id: { in: [...quantities.keys()] },
+        product: { storeId, ...(activeOnly ? { status: ProductStatus.ACTIVE } : {}) },
+      },
+      include: { product: true },
+    });
+    if (variants.length !== quantities.size) {
+      throw new BadRequestException('Some variants are not available');
+    }
+
+    let subtotal = new Prisma.Decimal(0);
+    const orderItems = variants.map((variant) => {
+      const quantity = quantities.get(variant.id) ?? 0;
+      if (variant.stock < quantity) {
+        throw new BadRequestException(`${variant.product.name} is out of stock`);
+      }
+      subtotal = subtotal.plus(variant.price.times(quantity));
+      return {
+        variantId: variant.id,
+        productNameSnapshot: variant.product.name,
+        variantLabelSnapshot: this.variantLabel(variant.optionValues),
+        unitPrice: variant.price,
+        quantity,
+      };
+    });
+
+    let discount: Discount | null = null;
+    let discountAmount = new Prisma.Decimal(0);
+    if (discountCode?.trim()) {
+      ({ discount, amount: discountAmount } = await this.discounts.quote(db, storeId, discountCode, subtotal));
+    }
+    return { orderItems, subtotal, discount, discountAmount, total: subtotal.minus(discountAmount) };
+  }
+
+  // Stock decrement only matches while enough is left, so two checkouts can't oversell.
+  private async reserve(tx: Prisma.TransactionClient, priced: Priced) {
+    for (const item of priced.orderItems) {
+      const { count } = await tx.productVariant.updateMany({
+        where: { id: item.variantId, stock: { gte: item.quantity } },
+        data: { stock: { decrement: item.quantity } },
+      });
+      if (count === 0) {
+        throw new BadRequestException(`${item.productNameSnapshot} is out of stock`);
+      }
+    }
+    if (priced.discount) {
+      await this.discounts.consume(tx, priced.discount);
+    }
   }
 
   private requiredText(value: string | undefined, field: string) {

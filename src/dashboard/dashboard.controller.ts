@@ -20,7 +20,7 @@ export class DashboardController {
       await Promise.all([
         this.prisma.product.count({ where: { storeId } }),
         this.prisma.product.count({ where: { storeId, status: ProductStatus.ACTIVE } }),
-        this.prisma.order.count({ where: { storeId } }),
+        this.prisma.order.count({ where: { storeId, status: { not: OrderStatus.DRAFT } } }),
         this.prisma.order.count({ where: { storeId, status: OrderStatus.PENDING } }),
         this.prisma.customer.count({ where: { storeId } }),
         // money actually collected: VNPAY confirmed by IPN, COD on delivery
@@ -35,7 +35,7 @@ export class DashboardController {
           take: 5,
         }),
         this.prisma.order.findMany({
-          where: { storeId },
+          where: { storeId, status: { not: OrderStatus.DRAFT } },
           orderBy: { createdAt: 'desc' },
           take: 5,
           include: { payments: true },

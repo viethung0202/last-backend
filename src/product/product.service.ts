@@ -1,13 +1,16 @@
 import { BadRequestException, Injectable, NotFoundException } from '@nestjs/common';
-import { ProductStatus } from '@prisma/client';
+import { Prisma, ProductStatus } from '@prisma/client';
+import { findProductCategory } from '../catalog/product-categories';
 import { PrismaService } from '../prisma/prisma.service';
 
 type ProductInput = {
   name?: string;
   description?: string | null;
-  priceCents?: number;
+  price?: number | string;
   stock?: number;
   status?: ProductStatus;
+  categorySlug?: string | null;
+  collectionIds?: string[];
 };
 
 @Injectable()
@@ -17,33 +20,51 @@ export class ProductService {
   findAllForStore(storeId: string) {
     return this.prisma.product.findMany({
       where: { storeId },
-      include: { variants: true },
+      include: {
+        category: true,
+        collections: { include: { collection: true } },
+        variants: true,
+      },
     });
   }
 
   // ponytail: every product gets one default variant (no options) unless the
   // caller creates additional ProductOption/ProductVariant rows later.
-  create(storeId: string, data: ProductInput) {
+  async create(storeId: string, data: ProductInput) {
     const name = this.requiredText(data.name, 'name');
-    const priceCents = this.requiredMoney(data.priceCents, 'priceCents');
+    const price = this.requiredMoney(data.price, 'price');
     const stock = this.optionalCount(data.stock, 'stock') ?? 0;
     const status = this.optionalStatus(data.status);
+    const categoryId = data.categorySlug
+      ? await this.ensureCategory(storeId, data.categorySlug)
+      : undefined;
+    await this.assertCollectionsBelongToStore(storeId, data.collectionIds ?? []);
 
     return this.prisma.product.create({
       data: {
         storeId,
+        categoryId,
         name,
         description: data.description?.trim() || null,
         status,
         variants: {
           create: {
-            priceCents,
+            price,
             stock,
             optionValues: {},
           },
         },
+        collections: {
+          create: (data.collectionIds ?? []).map((collectionId) => ({
+            collectionId,
+          })),
+        },
       },
-      include: { variants: true },
+      include: {
+        category: true,
+        collections: { include: { collection: true } },
+        variants: true,
+      },
     });
   }
 
@@ -60,6 +81,7 @@ export class ProductService {
       name?: string;
       description?: string | null;
       status?: ProductStatus;
+      categoryId?: string | null;
     } = {};
     if (data.name !== undefined) {
       productData.name = this.requiredText(data.name, 'name');
@@ -70,13 +92,23 @@ export class ProductService {
     if (data.status !== undefined) {
       productData.status = this.optionalStatus(data.status);
     }
+    if (data.categorySlug !== undefined) {
+      productData.categoryId = data.categorySlug
+        ? await this.ensureCategory(storeId, data.categorySlug)
+        : null;
+    }
 
-    const variantData: { priceCents?: number; stock?: number } = {};
-    if (data.priceCents !== undefined) {
-      variantData.priceCents = this.requiredMoney(data.priceCents, 'priceCents');
+    const variantData: { price?: Prisma.Decimal; stock?: number } = {};
+    if (data.price !== undefined) {
+      variantData.price = this.requiredMoney(data.price, 'price');
     }
     if (data.stock !== undefined) {
       variantData.stock = this.optionalCount(data.stock, 'stock');
+    }
+
+    const collectionIds = data.collectionIds;
+    if (collectionIds) {
+      await this.assertCollectionsBelongToStore(storeId, collectionIds);
     }
 
     await this.prisma.$transaction(async (tx) => {
@@ -85,6 +117,17 @@ export class ProductService {
           where: { id: productId },
           data: productData,
         });
+      }
+      if (collectionIds) {
+        await tx.productCollection.deleteMany({ where: { productId } });
+        if (collectionIds.length > 0) {
+          await tx.productCollection.createMany({
+            data: collectionIds.map((collectionId) => ({
+              productId,
+              collectionId,
+            })),
+          });
+        }
       }
       if (Object.keys(variantData).length > 0) {
         const variant = product.variants[0];
@@ -100,7 +143,11 @@ export class ProductService {
 
     return this.prisma.product.findFirst({
       where: { id: productId, storeId },
-      include: { variants: true },
+      include: {
+        category: true,
+        collections: { include: { collection: true } },
+        variants: true,
+      },
     });
   }
 
@@ -117,6 +164,7 @@ export class ProductService {
       this.prisma.productOptionValue.deleteMany({
         where: { option: { productId } },
       }),
+      this.prisma.productCollection.deleteMany({ where: { productId } }),
       this.prisma.productOption.deleteMany({ where: { productId } }),
       this.prisma.productVariant.deleteMany({ where: { productId } }),
       this.prisma.product.delete({ where: { id: productId } }),
@@ -133,11 +181,15 @@ export class ProductService {
     return text;
   }
 
-  private requiredMoney(value: number | undefined, field: string): number {
-    if (typeof value !== 'number' || !Number.isInteger(value) || value < 0) {
-      throw new BadRequestException(`${field} must be a non-negative integer`);
+  // Accepts 150000, 19.99 or "19.99"; fits Decimal(12,2).
+  private requiredMoney(value: number | string | undefined, field: string): Prisma.Decimal {
+    const text = typeof value === 'number' ? String(value) : value?.trim();
+    if (!text || !/^\d{1,10}(\.\d{1,2})?$/.test(text)) {
+      throw new BadRequestException(
+        `${field} must be a non-negative amount with at most 2 decimals`,
+      );
     }
-    return value;
+    return new Prisma.Decimal(text);
   }
 
   private optionalCount(
@@ -161,5 +213,33 @@ export class ProductService {
       throw new BadRequestException('status must be DRAFT or ACTIVE');
     }
     return value;
+  }
+
+  private async ensureCategory(storeId: string, categorySlug: string) {
+    const category = findProductCategory(categorySlug);
+    if (!category) {
+      throw new BadRequestException('Invalid categorySlug');
+    }
+    const row = await this.prisma.category.upsert({
+      where: { storeId_slug: { storeId, slug: category.slug } },
+      update: { name: category.name },
+      create: { storeId, slug: category.slug, name: category.name },
+    });
+    return row.id;
+  }
+
+  private async assertCollectionsBelongToStore(
+    storeId: string,
+    collectionIds: string[],
+  ) {
+    if (collectionIds.length === 0) {
+      return;
+    }
+    const count = await this.prisma.collection.count({
+      where: { storeId, id: { in: collectionIds } },
+    });
+    if (count !== new Set(collectionIds).size) {
+      throw new BadRequestException('Invalid collectionIds');
+    }
   }
 }

@@ -6,9 +6,25 @@ import { StoreModule } from './store/store.module';
 import { ProductModule } from './product/product.module';
 import { AuthModule } from './auth/auth.module';
 import { OrderModule } from './order/order.module';
+import { CollectionModule } from './collection/collection.module';
+import { CatalogModule } from './catalog/catalog.module';
+import { PaymentModule } from './payment/payment.module';
+import { CustomerModule } from './customer/customer.module';
+import { DashboardModule } from './dashboard/dashboard.module';
 
 @Module({
-  imports: [PrismaModule, AuthModule, StoreModule, ProductModule, OrderModule],
+  imports: [
+    PrismaModule,
+    AuthModule,
+    StoreModule,
+    ProductModule,
+    OrderModule,
+    CollectionModule,
+    CatalogModule,
+    PaymentModule,
+    CustomerModule,
+    DashboardModule,
+  ],
   controllers: [AppController],
   providers: [AppService],
 })

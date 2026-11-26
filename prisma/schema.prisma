@@ -38,6 +38,7 @@ model Store {
   orders         Order[]
   paymentMethods StorePaymentMethod[]
   discounts      Discount[]
+  pages          Page[]
 }
 
 enum StoreRole {
@@ -328,4 +329,38 @@ model Discount {
 
   @@unique([storeId, code])
   @@index([storeId])
+}
+
+// Page Builder: `draft` is edited freely; publish snapshots it into an immutable PageVersion.
+// Data format = Puck JSON: { root: { props }, content: [{ type, props }] } (flat list of sections).
+model Page {
+  id                 String       @id @default(cuid())
+  storeId            String
+  store              Store        @relation(fields: [storeId], references: [id])
+  // "home" is the storefront home page; others render at #/pages/<slug>
+  slug               String
+  title              String
+  draft              Json
+  publishedVersionId String?      @unique
+  publishedVersion   PageVersion? @relation("PublishedVersion", fields: [publishedVersionId], references: [id])
+  createdAt          DateTime     @default(now())
+  updatedAt          DateTime     @updatedAt
+
+  versions PageVersion[] @relation("PageVersions")
+
+  @@unique([storeId, slug])
+  @@index([storeId])
+}
+
+model PageVersion {
+  id        String   @id @default(cuid())
+  pageId    String
+  page      Page     @relation("PageVersions", fields: [pageId], references: [id])
+  version   Int
+  data      Json
+  createdAt DateTime @default(now())
+
+  publishedFor Page? @relation("PublishedVersion")
+
+  @@unique([pageId, version])
 }

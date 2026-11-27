@@ -12,6 +12,7 @@ import { PaymentModule } from './payment/payment.module';
 import { CustomerModule } from './customer/customer.module';
 import { DiscountModule } from './discount/discount.module';
 import { PageModule } from './page/page.module';
+import { PlatformModule } from './platform/platform.module';
 import { DashboardModule } from './dashboard/dashboard.module';
 
 @Module({
@@ -28,6 +29,7 @@ import { DashboardModule } from './dashboard/dashboard.module';
     DashboardModule,
     DiscountModule,
     PageModule,
+    PlatformModule,
   ],
   controllers: [AppController],
   providers: [AppService],

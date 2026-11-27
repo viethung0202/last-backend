@@ -21,13 +21,15 @@ model User {
 }
 
 model Store {
-  id        String   @id @default(cuid())
-  slug      String   @unique
+  id        String      @id @default(cuid())
+  slug      String      @unique
   name      String
   // ISO 4217 code; prices are Decimal(12,2) in this currency
-  currency  String   @default("VND")
+  currency  String      @default("VND")
   theme     Json?
-  createdAt DateTime @default(now())
+  // SUSPENDED (by platform admin): storefront and checkout are closed, merchants can still sign in
+  status    StoreStatus @default(ACTIVE)
+  createdAt DateTime    @default(now())
 
   members        StoreMember[]
   domains        StoreDomain[]
@@ -39,6 +41,11 @@ model Store {
   paymentMethods StorePaymentMethod[]
   discounts      Discount[]
   pages          Page[]
+}
+
+enum StoreStatus {
+  ACTIVE
+  SUSPENDED
 }
 
 enum StoreRole {
@@ -363,4 +370,31 @@ model PageVersion {
   publishedFor Page? @relation("PublishedVersion")
 
   @@unique([pageId, version])
+}
+
+enum TemplateSource {
+  PLATFORM
+  AI
+}
+
+// Starter page layouts (same JSON as Page.draft). Platform admins curate them; merchants
+// start a page from a published one. AI-generated layouts will land here too (Phase 6).
+model Template {
+  id           String         @id @default(cuid())
+  name         String
+  description  String?
+  category     String?
+  thumbnailUrl String?
+  data         Json
+  source       TemplateSource @default(PLATFORM)
+  published    Boolean        @default(false)
+  createdAt    DateTime       @default(now())
+  updatedAt    DateTime       @updatedAt
+}
+
+// Platform-wide config, e.g. key "vnpay" = { tmnCode, hashSecret, payUrl }.
+model PlatformSetting {
+  key       String   @id
+  value     Json
+  updatedAt DateTime @updatedAt
 }

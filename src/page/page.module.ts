@@ -8,5 +8,6 @@ import { PageService } from './page.service';
   imports: [AuthModule],
   controllers: [PageController, SiteController],
   providers: [PageService, TenantGuard],
+  exports: [PageService],
 })
 export class PageModule {}

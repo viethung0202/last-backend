@@ -18,7 +18,7 @@ export class PageController {
   }
 
   @Post()
-  create(@CurrentStore() store: Store, @Body() body: { title?: string; slug?: string; data?: unknown }) {
+  create(@CurrentStore() store: Store, @Body() body: { title?: string; slug?: string; data?: unknown; templateId?: string }) {
     return this.pages.create(store.id, body);
   }
 

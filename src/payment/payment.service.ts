@@ -2,6 +2,7 @@ import { BadRequestException, Injectable } from '@nestjs/common';
 import { OrderStatus, PaymentMethod, PaymentStatus, Prisma } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { buildPaymentUrl, toVnpAmount, verify, vnpayConfig } from './vnpay';
+import type { VnpayConfig } from './vnpay';
 
 type IpnResult = { RspCode: string; Message: string };
 
@@ -12,11 +13,12 @@ export class PaymentService {
   async getMethods(store: { id: string; currency: string }) {
     const rows = await this.prisma.storePaymentMethod.findMany({ where: { storeId: store.id } });
     const enabled = (method: PaymentMethod) => rows.some((row) => row.method === method && row.enabled);
+    const vnpayUsable = await this.vnpayUsable(store);
     return {
       COD: enabled(PaymentMethod.COD),
       // a stale VNPAY row is ignored if the platform lost its config or the store isn't VND
-      VNPAY: enabled(PaymentMethod.VNPAY) && this.vnpayUsable(store),
-      vnpayAvailable: this.vnpayUsable(store),
+      VNPAY: enabled(PaymentMethod.VNPAY) && vnpayUsable,
+      vnpayAvailable: vnpayUsable,
     };
   }
 
@@ -29,7 +31,7 @@ export class PaymentService {
       if (typeof enabled !== 'boolean') {
         throw new BadRequestException(`${method} must be true or false`);
       }
-      if (method === PaymentMethod.VNPAY && enabled && !this.vnpayUsable(store)) {
+      if (method === PaymentMethod.VNPAY && enabled && !(await this.vnpayUsable(store))) {
         throw new BadRequestException('VNPAY needs platform config and a VND store');
       }
       await this.prisma.storePaymentMethod.upsert({
@@ -56,7 +58,7 @@ export class PaymentService {
     returnUrl: string | undefined,
     ipAddr: string,
   ) {
-    const config = vnpayConfig();
+    const config = await this.config();
     if (!config) {
       throw new BadRequestException('VNPAY is not configured');
     }
@@ -101,7 +103,7 @@ export class PaymentService {
   }
 
   private async processIpn(query: Record<string, string>): Promise<IpnResult & { paymentId?: string }> {
-    const config = vnpayConfig();
+    const config = await this.config();
     if (!config || !verify(query, config.hashSecret)) {
       return { RspCode: '97', Message: 'Invalid signature' };
     }
@@ -143,7 +145,12 @@ export class PaymentService {
       : { ...base, RspCode: '02', Message: 'Order already confirmed' };
   }
 
-  private vnpayUsable(store: { currency: string }) {
-    return Boolean(vnpayConfig()) && store.currency === 'VND';
+  private async vnpayUsable(store: { currency: string }) {
+    return store.currency === 'VND' && Boolean(await this.config());
+  }
+
+  async config() {
+    const row = await this.prisma.platformSetting.findUnique({ where: { key: 'vnpay' } });
+    return vnpayConfig(row?.value as Partial<VnpayConfig> | null);
   }
 }

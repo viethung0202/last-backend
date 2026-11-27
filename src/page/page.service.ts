@@ -50,8 +50,13 @@ export class PageService {
     return page;
   }
 
-  async create(storeId: string, input: { title?: string; slug?: string; data?: unknown }) {
+  async create(storeId: string, input: { title?: string; slug?: string; data?: unknown; templateId?: string }) {
     const title = input.title?.trim();
+    if (input.templateId) {
+      const template = await this.prisma.template.findFirst({ where: { id: input.templateId, published: true } });
+      if (!template) throw new BadRequestException('Template not found');
+      input = { ...input, data: template.data };
+    }
     if (!title) throw new BadRequestException('title is required');
     const slug = (input.slug?.trim() || title).toLowerCase().normalize('NFD')
       .replace(/[̀-ͯ]/g, '').replace(/đ/g, 'd').replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');

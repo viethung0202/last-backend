@@ -10,16 +10,19 @@ export type VnpayConfig = {
   payUrl: string;
 };
 
-export function vnpayConfig(): VnpayConfig | null {
-  const tmnCode = process.env.VNPAY_TMN_CODE;
-  const hashSecret = process.env.VNPAY_HASH_SECRET;
+// Platform admin config (PlatformSetting "vnpay") wins; env vars are the fallback.
+export function vnpayConfig(stored?: Partial<VnpayConfig> | null): VnpayConfig | null {
+  const tmnCode = stored?.tmnCode || process.env.VNPAY_TMN_CODE;
+  const hashSecret = stored?.tmnCode ? stored.hashSecret : process.env.VNPAY_HASH_SECRET;
   if (!tmnCode || !hashSecret) {
     return null;
   }
   return {
     tmnCode,
     hashSecret,
-    payUrl: process.env.VNPAY_URL ?? 'https://sandbox.vnpayment.vn/paymentv2/vpcpay.html',
+    payUrl:
+      (stored?.tmnCode ? stored.payUrl : process.env.VNPAY_URL) ||
+      'https://sandbox.vnpayment.vn/paymentv2/vpcpay.html',
   };
 }
 

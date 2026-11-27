@@ -22,7 +22,7 @@ export function vnpayConfig(stored?: Partial<VnpayConfig> | null): VnpayConfig |
     hashSecret,
     payUrl:
       (stored?.tmnCode ? stored.payUrl : process.env.VNPAY_URL) ||
-      'https://sandbox.vnpayment.vn/paymentv2/vpcpay.html',
+      'https://sandbox.vnpaytest.vn/paymentv2/vpcpay.html',
   };
 }
 

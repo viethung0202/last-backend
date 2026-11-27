@@ -44,6 +44,16 @@ export class OrderController {
     return this.orders.findForGuest(store.id, orderId, email);
   }
 
+  @Post(':orderId/pay')
+  retryPayment(
+    @CurrentStore() store: { id: string; currency: string },
+    @Param('orderId') orderId: string,
+    @Ip() ip: string,
+    @Body() body: { email?: string; returnUrl?: string },
+  ) {
+    return this.orders.retryPayment(store, orderId, body, ip);
+  }
+
   @Patch(':orderId/status')
   @UseGuards(MerchantAuthGuard, StoreMemberGuard)
   updateStatus(

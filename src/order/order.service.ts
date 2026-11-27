@@ -63,7 +63,7 @@ export class OrderService {
   async findForGuest(storeId: string, orderId: string, email: string | undefined) {
     const order = await this.prisma.order.findFirst({
       where: { id: orderId, storeId, status: { not: OrderStatus.DRAFT }, guestEmail: email?.trim().toLowerCase() || '-' },
-      include: { items: true, payments: true },
+      include: { items: true, payments: { orderBy: { createdAt: 'asc' } } },
     });
     if (!order) {
       throw new NotFoundException('Order not found');
@@ -91,8 +91,7 @@ export class OrderService {
 
     const priced = await this.price(this.prisma, storeId, items, input.discountCode, true);
 
-    // ponytail: stock is reserved at order time; unpaid VNPAY orders keep it until
-    // the merchant cancels. Add an expiry job (BullMQ) if that becomes a problem.
+    // stock is reserved at order time; unpaid VNPAY orders are cancelled by OrderExpiryService
     const order = await this.prisma.$transaction(async (tx) => {
       await this.reserve(tx, priced);
 
@@ -124,6 +123,61 @@ export class OrderService {
     return { ...order, paymentUrl };
   }
 
+  // Cancelling gives back what the order reserved: stock and the discount use. The status guard
+  // makes it apply once, so a merchant cancel and the expiry sweep can't both restock.
+  private async cancelOrder(tx: Prisma.TransactionClient, order: { id: string; storeId: string; discountCode: string | null }) {
+    const { count } = await tx.order.updateMany({
+      where: { id: order.id, status: { notIn: [OrderStatus.CANCELLED, OrderStatus.DRAFT] } },
+      data: { status: OrderStatus.CANCELLED },
+    });
+    if (!count) return false;
+    const items = await tx.orderItem.findMany({ where: { orderId: order.id, variantId: { not: null } } });
+    for (const item of items) {
+      await tx.productVariant.update({ where: { id: item.variantId! }, data: { stock: { increment: item.quantity } } });
+    }
+    if (order.discountCode) {
+      await tx.discount.updateMany({
+        where: { storeId: order.storeId, code: order.discountCode, usedCount: { gt: 0 } },
+        data: { usedCount: { decrement: 1 } },
+      });
+    }
+    await tx.payment.updateMany({ where: { orderId: order.id, status: PaymentStatus.PENDING }, data: { status: PaymentStatus.FAILED } });
+    return true;
+  }
+
+  // Unpaid VNPAY orders: the payment link lives 15 minutes, so after `minutes` nobody can still pay.
+  async expireUnpaid(minutes: number) {
+    const orders = await this.prisma.order.findMany({
+      where: {
+        status: OrderStatus.PENDING,
+        createdAt: { lt: new Date(Date.now() - minutes * 60_000) },
+        payments: { some: { method: PaymentMethod.VNPAY }, none: { status: PaymentStatus.SUCCEEDED } },
+      },
+      select: { id: true, storeId: true, discountCode: true },
+      take: 100,
+    });
+    let cancelled = 0;
+    for (const order of orders) {
+      if (await this.prisma.$transaction((tx) => this.cancelOrder(tx, order))) cancelled++;
+    }
+    return cancelled;
+  }
+
+  // Customer pays again after a failed/abandoned VNPAY attempt. Each attempt is its own Payment
+  // (its id is the VNPAY txnRef), and whichever one the IPN confirms marks the order PAID.
+  async retryPayment(store: { id: string; currency: string }, orderId: string, input: { email?: string; returnUrl?: string }, ipAddr: string) {
+    await this.payments.assertEnabled(store, PaymentMethod.VNPAY);
+    const order = await this.findForGuest(store.id, orderId, input.email);
+    if (order.status !== OrderStatus.PENDING || !order.payments.some((p) => p.method === PaymentMethod.VNPAY)) {
+      throw new BadRequestException('This order cannot be paid online');
+    }
+    if (order.payments.some((p) => p.status === PaymentStatus.SUCCEEDED)) {
+      throw new BadRequestException('Order is already paid');
+    }
+    const payment = await this.prisma.payment.create({ data: { orderId, method: PaymentMethod.VNPAY, amount: order.total } });
+    return { paymentUrl: await this.payments.vnpayUrl(store.id, payment, input.returnUrl, ipAddr) };
+  }
+
   async updateStatus(storeId: string, orderId: string, status: OrderStatus) {
     if (!Object.values(OrderStatus).includes(status) || status === OrderStatus.DRAFT) {
       throw new BadRequestException('Invalid order status');
@@ -131,13 +185,20 @@ export class OrderService {
 
     const order = await this.prisma.order.findFirst({
       where: { id: orderId, storeId, status: { not: OrderStatus.DRAFT } },
-      select: { id: true },
+      select: { id: true, storeId: true, status: true, discountCode: true },
     });
     if (!order) {
       throw new NotFoundException('Order not found');
     }
+    if (order.status === OrderStatus.CANCELLED) {
+      throw new BadRequestException('A cancelled order cannot be changed');
+    }
 
     return this.prisma.$transaction(async (tx) => {
+      if (status === OrderStatus.CANCELLED) {
+        await this.cancelOrder(tx, order);
+        return tx.order.findUniqueOrThrow({ where: { id: orderId }, include: { items: true, payments: true } });
+      }
       // COD is collected on delivery
       if (status === OrderStatus.DELIVERED) {
         await tx.payment.updateMany({

@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # HTTP smoke test: VNPAY retry, cancel/expiry giving stock + discount back.
-# Server must run with VNPAY_HASH_SECRET=<same as below>, ORDER_EXPIRE_MINUTES=0.05, ORDER_SWEEP_SECONDS=1.
+# Server must run with VNPAY_HASH_SECRET=<same as below>, ORDER_EXPIRE_MINUTES=0.05, ORDER_SWEEP_SECONDS=1,
+# VNPAY_API_URL=http://localhost:4999 (this script starts test/mock-vnpay-refund.js there for the refund part).
 # Usage: API=http://localhost:3999 VNPAY_HASH_SECRET=SECRET bash test/smoke-payments.sh   (needs jq, run from backend/)
 set -euo pipefail
 API=${API:-http://localhost:3000}
@@ -24,7 +25,7 @@ used() { req "$S/discounts" "${D[@]}" >/dev/null; body | jq -r '.[0].usedCount';
 order() { # qty [discount]
   req "$S/orders" "${json[@]}" -d "{\"guestEmail\":\"g@x.com\",\"guestName\":\"G\",\"paymentMethod\":\"VNPAY\",\"returnUrl\":\"http://localhost:5175/\",\"discountCode\":\"${2:-}\",\"items\":[{\"variantId\":\"$VAR\",\"quantity\":$1}]}"; }
 ipn() { # txnRef amount code
-  local q; q=$(node -e "const v=require('./dist/payment/vnpay');const p={vnp_TxnRef:'$1',vnp_Amount:'$2',vnp_ResponseCode:'$3',vnp_TransactionStatus:'$3',vnp_TransactionNo:'14000001',vnp_TmnCode:'TEST'};console.log(v.signData(p)+'&vnp_SecureHash='+v.sign(p,'$SECRET'))")
+  local q; q=$(node -e "const v=require('./dist/payment/vnpay');const p={vnp_TxnRef:'$1',vnp_Amount:'$2',vnp_ResponseCode:'$3',vnp_TransactionStatus:'$3',vnp_TransactionNo:'14000001',vnp_PayDate:'20261128101500',vnp_TmnCode:'TEST'};console.log(v.signData(p)+'&vnp_SecureHash='+v.sign(p,'$SECRET'))")
   curl -s "$API/payments/vnpay/ipn?$q" | jq -r .RspCode; }
 ref() { sed -E 's/.*vnp_TxnRef=([^&]+).*/\1/' <<<"$1"; }
 amt() { sed -E 's/.*vnp_Amount=([^&]+).*/\1/' <<<"$1"; }
@@ -63,6 +64,22 @@ for _ in $(seq 1 15); do [ "$(status "$O3")" = CANCELLED ] && break; sleep 1; do
 [ "$(stock)" = 4 ] && [ "$(used)" = 0 ] || fail "expiry restore: stock $(stock) used $(used)"
 [ "$(req "$S/orders/$O3/pay" "${json[@]}" -d '{"email":"g@x.com","returnUrl":"http://localhost:5175/"}')" = 400 ] || fail "paying an expired order"
 [ "$(status "$O1")" = PAID ] || fail "paid order touched by sweep"
+
+# --- refund: a paid VNPAY order can't just be cancelled; refund returns the money, then cancels
+node test/mock-vnpay-refund.js 4999 "$SECRET" & MOCK=$!
+trap 'kill $MOCK 2>/dev/null; rm -f /tmp/mock-vnpay-fail' EXIT
+sleep 1
+[ "$(req -X PATCH "$S/orders/$O1/status" "${D[@]}" -d '{"status":"CANCELLED"}')" = 400 ] || fail "cancelled a paid online order"
+[ "$(req -X POST "$S/orders/$O1/refund" "${json[@]}")" = 401 ] || fail "refund without login"
+touch /tmp/mock-vnpay-fail
+[ "$(req -X POST "$S/orders/$O1/refund" "${D[@]}")" = 502 ] || fail "refused refund should be 502: $(body)"
+[ "$(status "$O1")" = PAID ] && [ "$(stock)" = 4 ] || fail "failed refund changed the order"
+rm -f /tmp/mock-vnpay-fail
+[ "$(req -X POST "$S/orders/$O1/refund" "${D[@]}")" = 201 ] || fail "refund $(body)"
+[ "$(body | jq -r .status)" = CANCELLED ] && [ "$(body | jq -r '[.payments[] | select(.status=="REFUNDED")] | length')" = 1 ] || fail "after refund: $(body)"
+[ "$(stock)" = 5 ] || fail "refund should restock, got $(stock)"
+[ "$(req -X POST "$S/orders/$O1/refund" "${D[@]}")" = 400 ] || fail "refunding twice"
+[ "$(req -X POST "$S/orders/$O3/refund" "${D[@]}")" = 400 ] || fail "refund of an unpaid order"
 
 rm -f $F
 echo "OK smoke-payments"

@@ -263,6 +263,7 @@ enum PaymentStatus {
   PENDING
   SUCCEEDED
   FAILED
+  REFUNDED
 }
 
 enum PaymentMethod {
@@ -291,6 +292,9 @@ model Payment {
   status            PaymentStatus @default(PENDING)
   amount            Decimal       @db.Decimal(12, 2)
   paidAt            DateTime?
+  // VNPAY: vnp_PayDate (yyyyMMddHHmmss), needed to refund the transaction
+  payDate           String?
+  refundedAt        DateTime?
   createdAt         DateTime      @default(now())
 
   webhookEvents PaymentWebhookEvent[]

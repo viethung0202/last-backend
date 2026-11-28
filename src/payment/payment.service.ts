@@ -1,7 +1,7 @@
-import { BadRequestException, Injectable } from '@nestjs/common';
+import { BadGatewayException, BadRequestException, Injectable } from '@nestjs/common';
 import { OrderStatus, PaymentMethod, PaymentStatus, Prisma } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
-import { buildPaymentUrl, toVnpAmount, verify, vnpayConfig } from './vnpay';
+import { buildPaymentUrl, buildRefundRequest, refundApiUrl, toVnpAmount, verify, verifyRefundResponse, vnpayConfig, vnpayDate } from './vnpay';
 import type { VnpayConfig } from './vnpay';
 
 type IpnResult = { RspCode: string; Message: string };
@@ -130,6 +130,7 @@ export class PaymentService {
           status: success ? PaymentStatus.SUCCEEDED : PaymentStatus.FAILED,
           providerPaymentId: query.vnp_TransactionNo ?? null,
           paidAt: success ? new Date() : null,
+          payDate: query.vnp_PayDate ?? null,
         },
       });
       if (count && success) {
@@ -143,6 +144,50 @@ export class PaymentService {
     return applied
       ? { ...base, RspCode: '00', Message: 'Confirm Success' }
       : { ...base, RspCode: '02', Message: 'Order already confirmed' };
+  }
+
+  // Asks VNPAY to send the money back (full amount). Resolves only when VNPAY confirms; any other
+  // outcome throws, so the caller never marks something refunded that VNPAY did not refund.
+  async refundVnpay(
+    payment: { id: string; amount: Prisma.Decimal; providerPaymentId: string | null; payDate: string | null; paidAt: Date | null },
+    createBy: string,
+    ipAddr: string,
+  ) {
+    const config = await this.config();
+    if (!config) {
+      throw new BadRequestException('VNPAY is not configured');
+    }
+    const request = buildRefundRequest(config, {
+      requestId: payment.id,
+      txnRef: payment.id,
+      amountVnd: payment.amount.toFixed(2),
+      transactionNo: payment.providerPaymentId ?? '',
+      transactionDate: payment.payDate ?? vnpayDate(payment.paidAt ?? new Date()),
+      createBy,
+      ipAddr,
+    });
+    let response: Response;
+    try {
+      response = await fetch(refundApiUrl(config), {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(request),
+        signal: AbortSignal.timeout(20_000),
+      });
+    } catch {
+      throw new BadGatewayException('Could not reach VNPAY to refund. Nothing was changed, try again.');
+    }
+    const res = (await response.json().catch(() => null)) as Record<string, string> | null;
+    if (!res) {
+      throw new BadGatewayException(`VNPAY refund API answered with an unexpected response (HTTP ${response.status}). Nothing was changed.`);
+    }
+    if (!verifyRefundResponse(res, config.hashSecret)) {
+      throw new BadGatewayException('VNPAY refund response failed signature check. Nothing was changed.');
+    }
+    // 00 = refunded; anything else (e.g. 94 duplicate, 95 not refundable) is reported as-is
+    if (res.vnp_ResponseCode !== '00') {
+      throw new BadGatewayException(`VNPAY refused the refund (${res.vnp_ResponseCode}: ${res.vnp_Message ?? 'no message'})`);
+    }
   }
 
   private async vnpayUsable(store: { currency: string }) {

@@ -185,13 +185,19 @@ export class OrderService {
 
     const order = await this.prisma.order.findFirst({
       where: { id: orderId, storeId, status: { not: OrderStatus.DRAFT } },
-      select: { id: true, storeId: true, status: true, discountCode: true },
+      select: {
+        id: true, storeId: true, status: true, discountCode: true,
+        payments: { where: { method: PaymentMethod.VNPAY, status: PaymentStatus.SUCCEEDED }, select: { id: true } },
+      },
     });
     if (!order) {
       throw new NotFoundException('Order not found');
     }
     if (order.status === OrderStatus.CANCELLED) {
       throw new BadRequestException('A cancelled order cannot be changed');
+    }
+    if (status === OrderStatus.CANCELLED && order.payments.length) {
+      throw new BadRequestException('This order was paid online. Refund it instead of cancelling');
     }
 
     return this.prisma.$transaction(async (tx) => {
@@ -211,6 +217,35 @@ export class OrderService {
         data: { status },
         include: { items: true, payments: true },
       });
+    });
+  }
+
+  // Money back first, then the order is cancelled (stock + discount returned). If VNPAY fails nothing changes.
+  // ponytail: no lock between the VNPAY call and our write; a double click is the same VNPAY request id
+  // (payment id), so VNPAY refuses the second. Add a REFUNDING status if admins ever refund concurrently.
+  async refund(storeId: string, orderId: string, createBy: string, ipAddr: string) {
+    const order = await this.prisma.order.findFirst({
+      where: { id: orderId, storeId },
+      select: { id: true, storeId: true, status: true, discountCode: true, payments: true },
+    });
+    if (!order) {
+      throw new NotFoundException('Order not found');
+    }
+    const payment = order.payments.find((p) => p.method === PaymentMethod.VNPAY && p.status === PaymentStatus.SUCCEEDED);
+    if (!payment) {
+      throw new BadRequestException('There is no paid VNPAY payment to refund');
+    }
+    if (order.status !== OrderStatus.PAID && order.status !== OrderStatus.SHIPPED) {
+      throw new BadRequestException('Only paid or shipped orders can be refunded');
+    }
+    await this.payments.refundVnpay(payment, createBy, ipAddr);
+    return this.prisma.$transaction(async (tx) => {
+      await tx.payment.updateMany({
+        where: { id: payment.id, status: PaymentStatus.SUCCEEDED },
+        data: { status: PaymentStatus.REFUNDED, refundedAt: new Date() },
+      });
+      await this.cancelOrder(tx, order);
+      return tx.order.findUniqueOrThrow({ where: { id: orderId }, include: { items: true, payments: true } });
     });
   }
 

@@ -1,5 +1,7 @@
 import { Body, Controller, Delete, Get, Put, Ip, Param, Patch, Post, Query, UseGuards } from '@nestjs/common';
 import { OrderStatus, PaymentMethod } from '@prisma/client';
+import { CurrentUser } from '../auth/current-user.decorator';
+import type { AuthUser } from '../auth/token.service';
 import { MerchantAuthGuard } from '../auth/merchant-auth.guard';
 import { StoreMemberGuard } from '../auth/store-member.guard';
 import { CurrentStore } from '../store/current-store.decorator';
@@ -62,6 +64,12 @@ export class OrderController {
     @Body() body: { status?: OrderStatus },
   ) {
     return this.orders.updateStatus(store.id, orderId, body.status as OrderStatus);
+  }
+
+  @Post(':orderId/refund')
+  @UseGuards(MerchantAuthGuard, StoreMemberGuard)
+  refund(@CurrentStore() store: { id: string }, @CurrentUser() user: AuthUser, @Param('orderId') orderId: string, @Ip() ip: string) {
+    return this.orders.refund(store.id, orderId, user.email, ip);
   }
 }
 
